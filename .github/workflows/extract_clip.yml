@@ -18,7 +18,7 @@ permissions:
 jobs:
   extract-clip:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout branch
         uses: actions/checkout@v4
@@ -47,6 +47,10 @@ jobs:
           import urllib.request
 
           import yt_dlp
+          try:
+              from curl_cffi import requests as cffi_requests
+          except Exception:
+              cffi_requests = None
 
           START_SEC = 29 * 60 + 30  # 1770
           END_SEC = 32 * 60 + 26    # 1946
@@ -54,8 +58,14 @@ jobs:
           OUT_FILE = "supernatural_s08e23_29m30s_32m26s.mp4"
           MAX_BYTES = 90 * 1024 * 1024
 
+
+          def gh_note(level, title, msg):
+              clean = str(msg).replace("\r", " ").replace("\n", " | ")[:800]
+              print(f"::{level} title={title}::{clean}", flush=True)
+
+
           if os.path.exists(OUT_FILE) and os.path.getsize(OUT_FILE) > 100000:
-              print(f"{OUT_FILE} already exists, exiting.")
+              gh_note("notice", "SKIP", f"{OUT_FILE} already exists")
               sys.exit(0)
 
 
@@ -73,7 +83,7 @@ jobs:
                   text=True,
               )
               if proc.returncode != 0:
-                  return False, f"ffprobe failed: {proc.stderr}"
+                  return False, f"ffprobe failed: {proc.stderr[-200:]}"
               data = json.loads(proc.stdout)
               dur = float(data.get("format", {}).get("duration") or 0)
               types = {s.get("codec_type") for s in data.get("streams", [])}
@@ -87,23 +97,49 @@ jobs:
           def rank_height(fmt):
               h = fmt.get("height") or 0
               pref = {720: 0, 480: 1, 360: 2, 1080: 3, 240: 4}
-              return (pref.get(h, 5 if 240 <= h <= 1080 else 9), - (fmt.get("tbr") or 0))
+              return (pref.get(h, 5 if 240 <= h <= 1080 else 9), -(fmt.get("tbr") or 0))
 
 
-          def fetch_bytes(url, headers, timeout=20, retries=3):
+          def fetch_bytes(url, headers, byte_range=None, timeout=25, retries=3, max_bytes=30 * 1024 * 1024):
+              hdrs = dict(headers or {})
+              if byte_range is not None:
+                  start_b, length_b = byte_range
+                  hdrs["Range"] = f"bytes={start_b}-{start_b + length_b - 1}"
               last_err = None
               for _ in range(retries):
                   try:
-                      req = urllib.request.Request(url, headers=headers)
+                      if cffi_requests is not None:
+                          r = cffi_requests.get(url, headers=hdrs, impersonate="chrome", timeout=timeout)
+                          if r.status_code >= 400:
+                              raise RuntimeError(f"HTTP {r.status_code}")
+                          if len(r.content) > max_bytes:
+                              raise RuntimeError(f"Response too large ({len(r.content)} bytes)")
+                          return r.content
+                      req = urllib.request.Request(url, headers=hdrs)
                       with urllib.request.urlopen(req, timeout=timeout) as resp:
-                          return resp.read()
+                          data = resp.read(max_bytes + 1)
+                          if len(data) > max_bytes:
+                              raise RuntimeError(f"Response too large (>{max_bytes} bytes)")
+                          return data
                   except Exception as e:
                       last_err = e
               raise last_err
 
 
+          def parse_byterange(spec, next_offsets, uri_key):
+              # spec like "524288@1048576" or "524288"
+              if "@" in spec:
+                  ln_s, off_s = spec.split("@", 1)
+                  ln, off = int(ln_s), int(off_s)
+              else:
+                  ln = int(spec)
+                  off = next_offsets.get(uri_key, 0)
+              next_offsets[uri_key] = off + ln
+              return (off, ln)
+
+
           def slice_hls_to_local(m3u8_url, headers, workdir, prefix):
-              raw_text = fetch_bytes(m3u8_url, headers).decode("utf-8", errors="replace")
+              raw_text = fetch_bytes(m3u8_url, headers, max_bytes=10 * 1024 * 1024).decode("utf-8", errors="replace")
               lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
               if any(l.startswith("#EXT-X-STREAM-INF") for l in lines):
                   raise RuntimeError("Got master playlist instead of media playlist")
@@ -113,10 +149,12 @@ jobs:
 
               cur_time = 0.0
               pending_dur = None
-              kept_segments = []  # (idx, abs_url, dur, seg_start)
+              pending_br_spec = None
+              next_offsets = {}
+              kept_segments = []  # (idx, abs_url, dur, byte_range)
               win_start = None
               target_dur = 10
-              init_map_url = None
+              init_map_info = None  # (abs_url, byte_range)
               key_line = None
 
               seg_idx = 0
@@ -127,24 +165,32 @@ jobs:
                       except Exception:
                           pass
                   elif line.startswith("#EXT-X-MAP:"):
-                      m = re.search(r'URI="([^"]+)"', line)
-                      if m:
-                          init_map_url = urllib.parse.urljoin(m3u8_url, m.group(1))
+                      m_uri = re.search(r'URI="([^"]+)"', line)
+                      if m_uri:
+                          map_abs = urllib.parse.urljoin(m3u8_url, m_uri.group(1))
+                          m_br = re.search(r'BYTERANGE="([^"]+)"', line)
+                          map_br = parse_byterange(m_br.group(1), next_offsets, map_abs) if m_br else None
+                          init_map_info = (map_abs, map_br)
                   elif line.startswith("#EXT-X-KEY:"):
                       m = re.search(r'URI="([^"]+)"', line)
                       if m:
                           key_abs = urllib.parse.urljoin(m3u8_url, m.group(1))
-                          key_bytes = fetch_bytes(key_abs, headers)
+                          key_bytes = fetch_bytes(key_abs, headers, max_bytes=1024 * 1024)
                           key_local = os.path.join(workdir, f"{prefix}_key.bin")
                           with open(key_local, "wb") as kf:
                               kf.write(key_bytes)
                           key_line = re.sub(r'URI="[^"]+"', f'URI="{key_local}"', line)
                       else:
                           key_line = line
+                  elif line.startswith("#EXT-X-BYTERANGE:"):
+                      pending_br_spec = line.split(":", 1)[1].strip()
                   elif line.startswith("#EXTINF:"):
                       dur_str = line.split(":", 1)[1].split(",")[0]
                       pending_dur = float(dur_str)
                   elif not line.startswith("#"):
+                      abs_url = urllib.parse.urljoin(m3u8_url, line)
+                      br = parse_byterange(pending_br_spec, next_offsets, abs_url) if pending_br_spec else None
+                      pending_br_spec = None
                       dur = pending_dur if pending_dur is not None else 4.0
                       pending_dur = None
                       seg_start = cur_time
@@ -153,29 +199,34 @@ jobs:
                       if seg_end > win_pad_start and seg_start < win_pad_end:
                           if win_start is None:
                               win_start = seg_start
-                          abs_url = urllib.parse.urljoin(m3u8_url, line)
-                          kept_segments.append((seg_idx, abs_url, dur))
+                          kept_segments.append((seg_idx, abs_url, dur, br))
                           seg_idx += 1
 
               if not kept_segments or win_start is None:
                   raise RuntimeError(f"No HLS segments in window (playlist total={cur_time:.1f}s)")
 
+              print(
+                  f"[{prefix}] HLS window: {len(kept_segments)} segs starting at {win_start:.2f}s "
+                  f"(total={cur_time:.1f}s, byterange={kept_segments[0][3] is not None})",
+                  flush=True,
+              )
+
               init_local = None
-              if init_map_url:
+              if init_map_info:
                   init_local = os.path.join(workdir, f"{prefix}_init.mp4")
                   with open(init_local, "wb") as f:
-                      f.write(fetch_bytes(init_map_url, headers))
+                      f.write(fetch_bytes(init_map_info[0], headers, byte_range=init_map_info[1]))
 
               def dl_seg(item):
-                  idx, u, dur = item
+                  idx, u, dur, br = item
                   local_p = os.path.join(workdir, f"{prefix}_seg_{idx:04d}.bin")
-                  data = fetch_bytes(u, headers)
+                  data = fetch_bytes(u, headers, byte_range=br)
                   with open(local_p, "wb") as f:
                       f.write(data)
                   return idx, local_p, dur
 
               downloaded = []
-              with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+              with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
                   for res in pool.map(dl_seg, kept_segments):
                       downloaded.append(res)
               downloaded.sort(key=lambda x: x[0])
@@ -209,34 +260,38 @@ jobs:
 
           info = None
           used_url = None
+          extract_errs = []
           for u in urls:
-              try:
-                  print(f"Extracting info from {u} ...")
-                  ydl_opts = {
-                      "quiet": False,
-                      "no_warnings": False,
-                      "socket_timeout": 15,
-                      "noplaylist": True,
-                  }
-                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                      info = ydl.extract_info(u, download=False)
-                  if info and info.get("formats"):
-                      used_url = u
-                      break
-              except Exception as e:
-                  print(f"Extract failed on {u}: {e}")
+              for use_imp in (True, False):
+                  try:
+                      ydl_opts = {
+                          "quiet": False,
+                          "socket_timeout": 15,
+                          "noplaylist": True,
+                      }
+                      if use_imp:
+                          from yt_dlp.networking.impersonate import ImpersonateTarget
+                          ydl_opts["impersonate"] = ImpersonateTarget("chrome")
+                      with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                          info = ydl.extract_info(u, download=False)
+                      if info and info.get("formats"):
+                          used_url = u
+                          break
+                  except Exception as e:
+                      extract_errs.append(f"{u}(imp={use_imp}): {e}")
+              if used_url:
+                  break
 
           if not info or not info.get("formats"):
-              print("ERROR: Could not extract formats from VK Video")
+              gh_note("error", "EXTRACT_FAIL", "; ".join(extract_errs))
               sys.exit(1)
 
           fmts = info["formats"]
-          print(f"Extracted {len(fmts)} formats:")
-          for f in fmts:
-              print(
-                  f"  id={f.get('format_id')} proto={f.get('protocol')} ext={f.get('ext')} "
-                  f"h={f.get('height')} vcodec={f.get('vcodec')} acodec={f.get('acodec')}"
-              )
+          fmt_summary = ", ".join(
+              f"{f.get('format_id')}[{f.get('protocol')}/{f.get('height')}p/{f.get('vcodec')}+{f.get('acodec')}]"
+              for f in fmts
+          )
+          gh_note("notice", "FORMATS", f"count={len(fmts)}: {fmt_summary}")
 
           base_headers = dict(info.get("http_headers") or {})
           base_headers.setdefault(
@@ -247,30 +302,32 @@ jobs:
 
           cand_out = "/tmp/ready_clip.mp4"
           done = False
+          diag_errors = []
 
-          # Strategy 1: Progressive HTTP MP4 with direct Range seek
-          prog_mp4s = [
+          # Strategy 2 FIRST (Parallel HLS window with BYTERANGE support — fastest & most reliable on VK/OK CDN!)
+          hls_muxed = [
               f for f in fmts
-              if f.get("protocol") in ("http", "https")
+              if f.get("protocol") in ("m3u8", "m3u8_native")
               and f.get("vcodec") not in (None, "none")
               and f.get("acodec") not in (None, "none")
               and f.get("url")
           ]
-          prog_mp4s.sort(key=rank_height)
-          for f in prog_mp4s:
-              print(f"Trying Strategy 1 (progressive HTTP seek) on {f.get('format_id')} ({f.get('height')}p)...")
-              hdrs = dict(base_headers)
-              hdrs.update(f.get("http_headers") or {})
-              hdr_str = "".join(f"{k}: {v}\r\n" for k, v in hdrs.items())
-              if os.path.exists(cand_out):
-                  os.remove(cand_out)
+          hls_muxed.sort(key=rank_height)
+          for f in hls_muxed[:2]:
+              wdir = tempfile.mkdtemp(prefix="hls_")
               try:
+                  hdrs = {**base_headers, **(f.get("http_headers") or {})}
+                  m3u8_local, win_start = slice_hls_to_local(f["url"], hdrs, wdir, "mux")
+                  offset = max(0.0, START_SEC - win_start)
+                  if os.path.exists(cand_out):
+                      os.remove(cand_out)
                   res = subprocess.run(
                       [
                           "ffmpeg", "-y",
-                          "-headers", hdr_str,
-                          "-ss", str(START_SEC),
-                          "-i", f["url"],
+                          "-allowed_extensions", "ALL",
+                          "-protocol_whitelist", "file,crypto,data",
+                          "-i", m3u8_local,
+                          "-ss", f"{offset:.3f}",
                           "-t", str(DURATION_SEC),
                           "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
                           "-c:a", "aac", "-b:a", "160k",
@@ -283,61 +340,17 @@ jobs:
                       timeout=90,
                   )
                   ok, msg = probe_clip(cand_out)
-                  print(f"Strategy 1 result: {msg}")
                   if ok:
+                      gh_note("notice", "HLS_MUX_OK", f"{f.get('format_id')}: {msg}")
                       done = True
                       break
+                  diag_errors.append(f"hls_mux({f.get('format_id')}): {msg} stderr={res.stderr[-250:]}")
               except Exception as e:
-                  print(f"Strategy 1 exception: {e}")
+                  diag_errors.append(f"hls_mux({f.get('format_id')}): {e}")
+              finally:
+                  shutil.rmtree(wdir, ignore_errors=True)
 
-          # Strategy 2: Parallel HLS segment window download (muxed or separate video+audio)
-          if not done:
-              hls_muxed = [
-                  f for f in fmts
-                  if f.get("protocol") in ("m3u8", "m3u8_native")
-                  and f.get("vcodec") not in (None, "none")
-                  and f.get("acodec") not in (None, "none")
-                  and f.get("url")
-              ]
-              hls_muxed.sort(key=rank_height)
-              for f in hls_muxed[:2]:
-                  print(f"Trying Strategy 2a (muxed HLS window) on {f.get('format_id')} ({f.get('height')}p)...")
-                  wdir = tempfile.mkdtemp(prefix="hls_")
-                  try:
-                      hdrs = dict(base_headers)
-                      hdrs.update(f.get("http_headers") or {})
-                      m3u8_local, win_start = slice_hls_to_local(f["url"], hdrs, wdir, "mux")
-                      offset = max(0.0, START_SEC - win_start)
-                      if os.path.exists(cand_out):
-                          os.remove(cand_out)
-                      subprocess.run(
-                          [
-                              "ffmpeg", "-y",
-                              "-allowed_extensions", "ALL",
-                              "-protocol_whitelist", "file,crypto,data",
-                              "-i", m3u8_local,
-                              "-ss", f"{offset:.3f}",
-                              "-t", str(DURATION_SEC),
-                              "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-                              "-c:a", "aac", "-b:a", "160k",
-                              "-movflags", "+faststart",
-                              cand_out,
-                          ],
-                          check=True,
-                          stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE,
-                          timeout=90,
-                      )
-                      ok, msg = probe_clip(cand_out)
-                      print(f"Strategy 2a result: {msg}")
-                      if ok:
-                          done = True
-                          break
-                  except Exception as e:
-                      print(f"Strategy 2a exception: {e}")
-                  finally:
-                      shutil.rmtree(wdir, ignore_errors=True)
-
+          # Strategy 2b: Split HLS video + audio window
           if not done:
               hls_v = [
                   f for f in fmts
@@ -357,14 +370,12 @@ jobs:
               hls_a.sort(key=lambda x: -(x.get("abr") or x.get("tbr") or 0))
               if hls_v and hls_a:
                   vf, af = hls_v[0], hls_a[0]
-                  print(f"Trying Strategy 2b (split HLS window) v={vf.get('format_id')} a={af.get('format_id')}...")
                   wdir = tempfile.mkdtemp(prefix="hls_split_")
                   try:
                       vhdrs = {**base_headers, **(vf.get("http_headers") or {})}
                       ahdrs = {**base_headers, **(af.get("http_headers") or {})}
                       v_m3u8, v_start = slice_hls_to_local(vf["url"], vhdrs, wdir, "v")
                       a_m3u8, a_start = slice_hls_to_local(af["url"], ahdrs, wdir, "a")
-                      # Trim each stream into temp files aligned at START_SEC, then mux
                       v_tmp = os.path.join(wdir, "v_trim.mp4")
                       a_tmp = os.path.join(wdir, "a_trim.m4a")
                       subprocess.run(
@@ -373,7 +384,7 @@ jobs:
                               "-i", v_m3u8, "-ss", f"{max(0.0, START_SEC - v_start):.3f}", "-t", str(DURATION_SEC),
                               "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-an", v_tmp,
                           ],
-                          check=True, timeout=90,
+                          check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90,
                       )
                       subprocess.run(
                           [
@@ -381,41 +392,89 @@ jobs:
                               "-i", a_m3u8, "-ss", f"{max(0.0, START_SEC - a_start):.3f}", "-t", str(DURATION_SEC),
                               "-c:a", "aac", "-b:a", "160k", "-vn", a_tmp,
                           ],
-                          check=True, timeout=60,
+                          check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
                       )
                       subprocess.run(
                           [
                               "ffmpeg", "-y", "-i", v_tmp, "-i", a_tmp,
                               "-c", "copy", "-movflags", "+faststart", cand_out,
                           ],
-                          check=True, timeout=30,
+                          check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
                       )
                       ok, msg = probe_clip(cand_out)
-                      print(f"Strategy 2b result: {msg}")
                       if ok:
+                          gh_note("notice", "HLS_SPLIT_OK", msg)
                           done = True
+                      else:
+                          diag_errors.append(f"hls_split: {msg}")
                   except Exception as e:
-                      print(f"Strategy 2b exception: {e}")
+                      diag_errors.append(f"hls_split: {e}")
                   finally:
                       shutil.rmtree(wdir, ignore_errors=True)
 
-          # Strategy 3: Fast 360p/480p full download with 16 threads + local ffmpeg cut
+          # Strategy 1: Progressive HTTP MP4 (single top candidate, 50s timeout)
           if not done:
-              print("Trying Strategy 3 (fast <=480p 16-thread download + local cut)...")
+              prog_mp4s = [
+                  f for f in fmts
+                  if f.get("protocol") in ("http", "https")
+                  and f.get("vcodec") not in (None, "none")
+                  and f.get("acodec") not in (None, "none")
+                  and f.get("url")
+              ]
+              prog_mp4s.sort(key=rank_height)
+              for f in prog_mp4s[:1]:
+                  hdrs = {**base_headers, **(f.get("http_headers") or {})}
+                  hdr_str = "".join(f"{k}: {v}\r\n" for k, v in hdrs.items())
+                  if os.path.exists(cand_out):
+                      os.remove(cand_out)
+                  try:
+                      res = subprocess.run(
+                          [
+                              "ffmpeg", "-y",
+                              "-headers", hdr_str,
+                              "-ss", str(START_SEC),
+                              "-i", f["url"],
+                              "-t", str(DURATION_SEC),
+                              "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                              "-c:a", "aac", "-b:a", "160k",
+                              "-movflags", "+faststart",
+                              cand_out,
+                          ],
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          text=True,
+                          timeout=50,
+                      )
+                      ok, msg = probe_clip(cand_out)
+                      if ok:
+                          gh_note("notice", "PROG_OK", f"{f.get('format_id')}: {msg}")
+                          done = True
+                          break
+                      diag_errors.append(f"prog({f.get('format_id')}): {msg} stderr={res.stderr[-250:]}")
+                  except Exception as e:
+                      diag_errors.append(f"prog({f.get('format_id')}): {e}")
+
+          # Strategy 3: yt-dlp CLI with 16 threads on <=480p + local ffmpeg cut
+          if not done:
               wdir = tempfile.mkdtemp(prefix="full_")
               try:
-                  out_tmpl = os.path.join(wdir, "full.%(ext)s")
-                  ydl_opts = {
-                      "format": "b[height<=480]/bv*[height<=480]+ba/b[height<=720]/bv*[height<=720]+ba/b",
-                      "outtmpl": out_tmpl,
-                      "merge_output_format": "mp4",
-                      "concurrent_fragment_downloads": 16,
-                      "socket_timeout": 15,
-                      "retries": 5,
-                      "noplaylist": True,
-                  }
-                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                      ydl.download([used_url])
+                  res = subprocess.run(
+                      [
+                          "/tmp/venv/bin/yt-dlp",
+                          "--no-playlist",
+                          "-N", "16",
+                          "--socket-timeout", "15",
+                          "--retries", "5",
+                          "-f", "b[height<=480]/bv*[height<=480]+ba/b[height<=360]/bv*[height<=360]+ba/w",
+                          "--merge-output-format", "mp4",
+                          "-o", os.path.join(wdir, "full.%(ext)s"),
+                          used_url,
+                      ],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      text=True,
+                      timeout=600,
+                  )
                   files = [os.path.join(wdir, x) for x in os.listdir(wdir) if not x.endswith(".part")]
                   if files:
                       full_file = max(files, key=os.path.getsize)
@@ -431,23 +490,28 @@ jobs:
                               cand_out,
                           ],
                           check=True,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
                           timeout=90,
                       )
                       ok, msg = probe_clip(cand_out)
-                      print(f"Strategy 3 result: {msg}")
                       if ok:
+                          gh_note("notice", "FULL_OK", msg)
                           done = True
+                      else:
+                          diag_errors.append(f"full_probe: {msg}")
+                  else:
+                      diag_errors.append(f"full_dl_empty: rc={res.returncode} err={res.stderr[-300:]}")
               except Exception as e:
-                  print(f"Strategy 3 exception: {e}")
+                  diag_errors.append(f"full_exc: {e}")
               finally:
                   shutil.rmtree(wdir, ignore_errors=True)
 
           if not done:
-              print("ERROR: All download strategies failed.")
+              gh_note("error", "ALL_STRATEGIES_FAILED", " ; ".join(diag_errors))
               sys.exit(1)
 
           if os.path.getsize(cand_out) > MAX_BYTES:
-              print("Re-encoding to fit under 90 MB...")
               subprocess.run(
                   [
                       "ffmpeg", "-y", "-i", cand_out,
@@ -464,7 +528,7 @@ jobs:
               shutil.move(cand_out, OUT_FILE)
 
           ok, msg = probe_clip(OUT_FILE)
-          print(f"Final clip verified: {msg}")
+          gh_note("notice", "FINAL_CLIP", msg)
           if not ok:
               sys.exit(1)
           EOF
