@@ -1,0 +1,139 @@
+name: Extract Video Clip (29:30 - 32:26)
+
+on:
+  push:
+    branches:
+      - "arena/dc5c016f-skjs"
+    paths:
+      - ".github/workflows/extract_clip.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract-clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Install latest yt-dlp and ffmpeg
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+          python3 -m pip install --upgrade --pre "yt-dlp[default]"
+          yt-dlp --version
+          ffmpeg -version | head -n 2
+
+      - name: Download and cut 29:30 - 32:26
+        run: |
+          set -e
+          OUT="supernatural_s08e23_29m30s_32m26s.mp4"
+          if [ -f "$OUT" ]; then
+            echo "Clip $OUT already exists, skipping."
+            exit 0
+          fi
+
+          URLS=(
+            "https://vkvideo.ru/video-221125343_456265914"
+            "https://vk.com/video-221125343_456265914"
+            "https://m.vkvideo.ru/video-221125343_456265914"
+          )
+
+          SUCCESS=0
+          for URL in "${URLS[@]}"; do
+            echo "=== Trying section download from $URL ==="
+            rm -f /tmp/section_clip.*
+            if yt-dlp --no-playlist \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+              --download-sections "*29:30-32:26" \
+              --force-keyframes-at-cuts \
+              -f "bv*[height<=720]+ba/b[height<=720]/b" \
+              --merge-output-format mp4 \
+              -o "/tmp/section_clip.%(ext)s" \
+              "$URL"; then
+              CANDIDATE=$(ls /tmp/section_clip.* 2>/dev/null | head -n 1 || true)
+              if [ -n "$CANDIDATE" ] && [ -s "$CANDIDATE" ]; then
+                DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$CANDIDATE" || echo "0")
+                DUR_INT=${DUR%.*}
+                echo "Downloaded section duration: ${DUR}s"
+                if [ "${DUR_INT:-0}" -ge 165 ] && [ "${DUR_INT:-0}" -le 190 ]; then
+                  mv "$CANDIDATE" /tmp/ready_clip.mp4
+                  SUCCESS=1
+                  break
+                fi
+              fi
+            fi
+
+            echo "=== Trying full download + local ffmpeg cut from $URL ==="
+            rm -f /tmp/full_video.*
+            if yt-dlp --no-playlist \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+              --concurrent-fragments 8 \
+              -f "bv*[height<=720]+ba/b[height<=720]/b" \
+              --merge-output-format mp4 \
+              -o "/tmp/full_video.%(ext)s" \
+              "$URL"; then
+              FULL_FILE=$(ls /tmp/full_video.* 2>/dev/null | head -n 1 || true)
+              if [ -n "$FULL_FILE" ] && [ -s "$FULL_FILE" ]; then
+                ffmpeg -y -ss 1770 -i "$FULL_FILE" -t 176 \
+                  -c:v libx264 -preset veryfast -crf 22 \
+                  -c:a aac -b:a 160k \
+                  -movflags +faststart \
+                  /tmp/ready_clip.mp4
+                rm -f "$FULL_FILE"
+                if [ -s /tmp/ready_clip.mp4 ]; then
+                  SUCCESS=1
+                  break
+                fi
+              fi
+            fi
+          done
+
+          if [ "$SUCCESS" -ne 1 ]; then
+            echo "Failed to download video from VK Video on runner."
+            exit 1
+          fi
+
+          # Ensure file fits comfortably under GitHub's 100 MB per-file limit (< 90 MB)
+          SIZE_BYTES=$(stat -c%s /tmp/ready_clip.mp4)
+          echo "Clip size: $SIZE_BYTES bytes"
+          if [ "$SIZE_BYTES" -gt 94371840 ]; then
+            echo "Re-encoding to fit under 90 MB..."
+            ffmpeg -y -i /tmp/ready_clip.mp4 \
+              -c:v libx264 -preset veryfast -b:v 3500k -maxrate 4200k -bufsize 7000k \
+              -c:a aac -b:a 128k \
+              -movflags +faststart \
+              "$OUT"
+            rm -f /tmp/ready_clip.mp4
+          else
+            mv /tmp/ready_clip.mp4 "$OUT"
+          fi
+
+          ls -lh "$OUT"
+          ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 "$OUT"
+
+      - name: Upload clip artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supernatural-clip
+          path: supernatural_s08e23_29m30s_32m26s.mp4
+
+      - name: Commit and push clip to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add supernatural_s08e23_29m30s_32m26s.mp4
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "Add video clip (29:30-32:26) from video-221125343_456265914"
+            git pull --rebase origin "${{ github.ref_name }}"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
