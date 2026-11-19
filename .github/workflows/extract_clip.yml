@@ -8,13 +8,17 @@ on:
       - ".github/workflows/extract_clip.yml"
   workflow_dispatch:
 
+concurrency:
+  group: extract-clip-${{ github.ref_name }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
 jobs:
   extract-clip:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: Checkout branch
         uses: actions/checkout@v4
@@ -22,17 +26,18 @@ jobs:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
 
-      - name: Install latest yt-dlp and ffmpeg
+      - name: Set up yt-dlp in virtualenv
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y ffmpeg
-          python3 -m pip install --upgrade --pre "yt-dlp[default]"
-          yt-dlp --version
-          ffmpeg -version | head -n 2
+          set -e
+          which ffmpeg && ffmpeg -version | head -n 1
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet --upgrade --pre "yt-dlp[default,curl-cffi]"
+          /tmp/venv/bin/yt-dlp --version
 
       - name: Download and cut 29:30 - 32:26
         run: |
           set -e
+          YTDLP="/tmp/venv/bin/yt-dlp"
           OUT="supernatural_s08e23_29m30s_32m26s.mp4"
           if [ -f "$OUT" ]; then
             echo "Clip $OUT already exists, skipping."
@@ -47,10 +52,14 @@ jobs:
 
           SUCCESS=0
           for URL in "${URLS[@]}"; do
-            echo "=== Trying section download from $URL ==="
+            echo "=== Probing formats for $URL ==="
+            timeout 30 "$YTDLP" --no-playlist --socket-timeout 15 --impersonate chrome -F "$URL" || \
+              timeout 30 "$YTDLP" --no-playlist --socket-timeout 15 -F "$URL" || true
+
+            echo "=== Attempt 1: fast section download from $URL ==="
             rm -f /tmp/section_clip.*
-            if yt-dlp --no-playlist \
-              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+            if timeout 120 "$YTDLP" --no-playlist \
+              --socket-timeout 15 --retries 3 \
               --download-sections "*29:30-32:26" \
               --force-keyframes-at-cuts \
               -f "bv*[height<=720]+ba/b[height<=720]/b" \
@@ -70,11 +79,11 @@ jobs:
               fi
             fi
 
-            echo "=== Trying full download + local ffmpeg cut from $URL ==="
+            echo "=== Attempt 2: full <=720p download (8 threads) + local ffmpeg cut ==="
             rm -f /tmp/full_video.*
-            if yt-dlp --no-playlist \
-              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
-              --concurrent-fragments 8 \
+            if timeout 210 "$YTDLP" --no-playlist \
+              --socket-timeout 15 --retries 3 \
+              -N 8 \
               -f "bv*[height<=720]+ba/b[height<=720]/b" \
               --merge-output-format mp4 \
               -o "/tmp/full_video.%(ext)s" \
@@ -100,7 +109,6 @@ jobs:
             exit 1
           fi
 
-          # Ensure file fits comfortably under GitHub's 100 MB per-file limit (< 90 MB)
           SIZE_BYTES=$(stat -c%s /tmp/ready_clip.mp4)
           echo "Clip size: $SIZE_BYTES bytes"
           if [ "$SIZE_BYTES" -gt 94371840 ]; then
@@ -117,13 +125,6 @@ jobs:
 
           ls -lh "$OUT"
           ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 "$OUT"
-
-      - name: Upload clip artifact
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: supernatural-clip
-          path: supernatural_s08e23_29m30s_32m26s.mp4
 
       - name: Commit and push clip to repository
         run: |
